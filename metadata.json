@@ -1,0 +1,6 @@
+{
+  "name": "TodoRelatos",
+  "description": "Lector offline de relatos con web scraping inteligente, almacenamiento Room y modo nocturno AMOLED.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,25 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Luna Creciente Nocturna -->
+    <path
+        android:fillColor="#FFFFB74D"
+        android:pathData="M66,32 C62,32 58.5,33.5 56,36 C61,39 63,45 61,50.5 C59,56 53.5,59.5 47.5,58.5 C49.5,61.5 53,63.5 57,63.5 C65.5,63.5 72.5,56.5 72.5,48 C72.5,39.5 69.5,33.5 66,32 Z" />
+    
+    <!-- Libro Abierto -->
+    <path
+        android:fillColor="#FFF1F5F9"
+        android:pathData="M28,68 C35,65 46,65 52,70 C58,65 69,65 76,68 L76,46 C69,43 58,43 52,48 C46,43 35,43 28,46 Z" />
+
+    <!-- Lomo y Detalle Central del Libro -->
+    <path
+        android:fillColor="#FF818CF8"
+        android:pathData="M51,47 L53,47 L53,70 L51,70 Z" />
+
+    <!-- Estrella Nocturna -->
+    <path
+        android:fillColor="#FFFFB74D"
+        android:pathData="M38,36 L39.5,39 L42.5,39.5 L40,41.5 L41,44.5 L38,43 L35,44.5 L36,41.5 L33.5,39.5 L36.5,39 Z" />
+</vector>
