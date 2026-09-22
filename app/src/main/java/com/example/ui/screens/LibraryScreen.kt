@@ -47,6 +47,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -134,6 +137,49 @@ fun LibraryScreen(
                     color = TextSecondaryAmoled,
                     fontSize = 13.sp
                 )
+            }
+
+            if (totalCount > 0) {
+                var showDeleteAllDialog by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+
+                IconButton(
+                    onClick = { showDeleteAllDialog = true },
+                    modifier = Modifier.testTag("delete_all_stories_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteOutline,
+                        contentDescription = "Vaciar biblioteca offline",
+                        tint = RoseError
+                    )
+                }
+
+                if (showDeleteAllDialog) {
+                    androidx.compose.material3.AlertDialog(
+                        onDismissRequest = { showDeleteAllDialog = false },
+                        containerColor = AmoledCard,
+                        titleContentColor = TextPrimaryAmoled,
+                        textContentColor = TextSecondaryAmoled,
+                        title = { Text("¿Vaciar biblioteca offline?") },
+                        text = { Text("Se eliminarán todos los relatos guardados en el dispositivo. Esta acción no se puede deshacer.") },
+                        confirmButton = {
+                            androidx.compose.material3.TextButton(
+                                onClick = {
+                                    viewModel.deleteAllStories()
+                                    showDeleteAllDialog = false
+                                }
+                            ) {
+                                Text("Vaciar Todo", color = RoseError, fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            androidx.compose.material3.TextButton(
+                                onClick = { showDeleteAllDialog = false }
+                            ) {
+                                Text("Cancelar", color = TextPrimaryAmoled)
+                            }
+                        }
+                    )
+                }
             }
         }
 

@@ -4,9 +4,15 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Update
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * Data Access Object para la entidad StoryEntity.
+ *
+ * Todas las operaciones de modificación son suspend functions.
+ * Las consultas reactivas devuelven Flow<T>.
+ */
 @Dao
 interface StoryDao {
 
@@ -59,5 +65,11 @@ interface StoryDao {
     suspend fun deleteStory(id: String)
 
     @Query("DELETE FROM stories")
-    suspend fun deleteAll()
+    suspend fun deleteAllStories()
+
+    @Transaction
+    suspend fun replaceAllStories(stories: List<StoryEntity>) {
+        deleteAllStories()
+        insertStories(stories)
+    }
 }

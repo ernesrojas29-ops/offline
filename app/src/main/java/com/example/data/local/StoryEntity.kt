@@ -1,23 +1,52 @@
 package com.example.data.local
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
  * Entidad Room para almacenar relatos descargados offline.
  *
- * Cumple con la regla de negocio: duración máxima <= 25 minutos.
+ * Índices:
+ * - Índice único en 'id' (clave primaria) y en 'category' para consultas rápidas.
+ * - Validación estricta de regla de negocio: duración máxima <= 25 minutos.
  */
-@Entity(tableName = "stories")
+@Entity(
+    tableName = "stories",
+    indices = [
+        Index(value = ["id"], unique = true),
+        Index(value = ["category"]),
+        Index(value = ["isFavorite"]),
+        Index(value = ["isRead"])
+    ]
+)
 data class StoryEntity(
     @PrimaryKey
-    val id: String, // Slug o URL única del relato para evitar duplicados
+    @ColumnInfo(name = "id")
+    val id: String, // ID numérico o slug único del relato (ej. "262742")
+
+    @ColumnInfo(name = "title")
     val title: String,
+
+    @ColumnInfo(name = "category")
     val category: String,
+
+    @ColumnInfo(name = "author")
     val author: String,
-    val durationMinutes: Int, // Duración validada <= 25 minutos
-    val contentHtmlOrText: String, // Texto limpio del relato para lectura nocturna
+
+    @ColumnInfo(name = "durationMinutes")
+    val durationMinutes: Int, // Duración validada estricta <= 25 minutos
+
+    @ColumnInfo(name = "contentHtmlOrText")
+    val contentHtmlOrText: String, // Texto limpio formateado para lectura nocturna
+
+    @ColumnInfo(name = "isFavorite", defaultValue = "0")
     val isFavorite: Boolean = false,
+
+    @ColumnInfo(name = "isRead", defaultValue = "0")
     val isRead: Boolean = false,
+
+    @ColumnInfo(name = "savedAt")
     val savedAt: Long = System.currentTimeMillis()
 )

@@ -3,13 +3,29 @@ package com.example.data.scraper
 import android.util.Log
 import com.example.data.local.StoryEntity
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
 
+/**
+ * Servicio de Web Scraping para https://movil.todorelatos.com/
+ *
+ * Características clave:
+ * 1. Enfoque 100% real: Cero datos falsos o mock data en caso de fallo.
+ * 2. Manejo de URLs reales:
+ *    - Categorías numéricas: /categorias/(\d+)/
+ *    - Relatos: /relato/(\d+)/
+ *    - Autores: /perfil/(\d+)/ o texto "por [autor]"
+ * 3. Detección precisa de tiempo de lectura:
+ *    - Patrón: "Tiempo estimado de lectura: [ 15 min. ]", "[ 12 min. ]", "15 min", etc.
+ *    - Fallback algorítmico si no existe etiqueta: conteo de palabras / 190 ppm.
+ * 4. Regla crítica de negocio:
+ *    - Si duración > 25 minutos, se omite de inmediato (sin descargar cuerpo pesado).
+ * 5. Control anti-baneo:
+ *    - Constante ANTI_BAN_DELAY_MS = 1200L para pausar entre peticiones en el repositorio.
+ */
 class ScraperService {
 
     companion object {
@@ -20,38 +36,82 @@ class ScraperService {
         // Regla de Negocio Crítica: Máximo 25 minutos de lectura
         const val MAX_ALLOWED_DURATION_MINUTES = 25
 
-        // Control Anti-Baneo: 1200 ms entre descargas
+        // Control Anti-Baneo obligatorio entre descargas consecutivas
         const val ANTI_BAN_DELAY_MS = 1200L
 
-        // User-Agent móvil realista
-        const val USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.133 Mobile Safari/537.36"
+        // Timeout estricto de red: 10 segundos
+        private const val TIMEOUT_MS = 10000
 
-        private const val TIMEOUT_MS = 15000
+        // Palabras por minuto promedio para estimar duración de lectura
+        private const val WORDS_PER_MINUTE = 190
+
+        // User-Agent móvil moderno y realista
+        const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UD1A.230803.041; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.133 Mobile Safari/537.36"
     }
 
-    // Expresión Regular para extraer la duración numérica de cadenas como:
-    // "Lectura: 12 min", "5 min", "Lectura aproximada 18 minutos", "Duración: 7m"
-    private val durationRegex =
-        """(?:lectura|duraci[oó]n|aprox)?[:\s]*(\d+)\s*(?:minutos?|mins?|m\b)""".toRegex(RegexOption.IGNORE_CASE)
+    // Regex 1: Formato real del sitio "Tiempo estimado de lectura: [ 15 min. ]" o "[ 15 min. ]"
+    private val bracketsDurationRegex =
+        """\[\s*(\d+)\s*min(?:\.|\b)""".toRegex(RegexOption.IGNORE_CASE)
 
-    // Regex alternativo para encontrar cualquier dígito antes de min
-    private val fallbackDurationRegex = """(\d+)\s*(?:min|minuto)""".toRegex(RegexOption.IGNORE_CASE)
+    // Regex 2: Formatos alternativos en listas: "Lectura: 12 min", "15 min.", "15 minutos"
+    private val generalDurationRegex =
+        """(?:lectura|duraci[oó]n|tiempo)?[:\s]*(\d+)\s*(?:minutos?|mins?|min\.?|m\b)""".toRegex(RegexOption.IGNORE_CASE)
+
+    // Regex 3: Fallback numérico antes de palabra min
+    private val fallbackDurationRegex =
+        """(\d+)\s*(?:min|minuto)""".toRegex(RegexOption.IGNORE_CASE)
+
+    // Regex para identificar enlaces a relatos: /relato/ID/
+    private val storyLinkRegex = """/relato/(\d+)/?""".toRegex()
+
+    // Regex para identificar enlaces a categorías numéricas: /categorias/ID/ o /categoria/ID/
+    private val categoryLinkRegex = """/categorias?/(\d+)/?""".toRegex()
 
     /**
-     * Extrae el número entero de minutos usando Regex.
-     * Retorna -1 si no se detectó duración explícita.
+     * Extrae el número entero de minutos de cadenas de texto tales como:
+     * - "Tiempo estimado de lectura: [ 15 min. ]"
+     * - "[ 8 min. ]"
+     * - "Lectura: 12 min"
+     * - "5 min"
+     * Retorna -1 si no se localizó una duración explícita.
      */
     fun extractDurationMinutes(rawText: String): Int {
         if (rawText.isBlank()) return -1
 
-        val match = durationRegex.find(rawText) ?: fallbackDurationRegex.find(rawText)
-        return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1
+        // Prioridad 1: Formato con corchetes [ XX min. ]
+        bracketsDurationRegex.find(rawText)?.let { match ->
+            match.groupValues.getOrNull(1)?.toIntOrNull()?.let { return it }
+        }
+
+        // Prioridad 2: Formato general "Lectura: XX min"
+        generalDurationRegex.find(rawText)?.let { match ->
+            match.groupValues.getOrNull(1)?.toIntOrNull()?.let { return it }
+        }
+
+        // Prioridad 3: Fallback "XX min"
+        fallbackDurationRegex.find(rawText)?.let { match ->
+            match.groupValues.getOrNull(1)?.toIntOrNull()?.let { return it }
+        }
+
+        return -1
     }
 
     /**
-     * Obtiene el listado de categorías conectándose a https://movil.todorelatos.com/categorias/.
-     * Si no hay conexión o falla la web, retorna las categorías conocidas del sitio para modo offline.
+     * Calcula la duración aproximada en minutos a partir del texto limpio.
+     * Utiliza el estándar de lectura de 190 palabras por minuto.
+     */
+    fun calculateDurationFromWordCount(text: String): Int {
+        if (text.isBlank()) return 0
+        val words = text.split("""\s+""".toRegex()).count { it.isNotBlank() }
+        val minutes = words / WORDS_PER_MINUTE
+        return if (minutes < 1) 1 else minutes
+    }
+
+    /**
+     * Conecta a https://movil.todorelatos.com/categorias/ y extrae las categorías reales.
+     * Selector real: Parsear los enlaces que apunten a /categorias/ID/.
+     * Lanza ScrapingException si la red falla o la página no contiene datos válidos.
      */
     suspend fun fetchCategories(): List<CategoryItem> = withContext(Dispatchers.IO) {
         val categories = mutableListOf<CategoryItem>()
@@ -64,39 +124,64 @@ class ScraperService {
                 .timeout(TIMEOUT_MS)
                 .get()
 
-            // Buscar enlaces de categorías en el HTML
-            val elements = doc.select("a[href*=/categoria/], a[href*=/relatos/], .categorias a, .list-group-item a, ul.categorias li a")
+            // Buscar todos los enlaces que contengan /categorias/
+            val links = doc.select("a[href*=/categorias/]")
 
-            for (element in elements) {
-                val href = element.attr("abs:href").ifBlank { element.attr("href") }
-                val name = element.text().trim()
+            for (link in links) {
+                val href = link.attr("href")
+                val absUrl = link.attr("abs:href").ifBlank {
+                    if (href.startsWith("http")) href else "$BASE_URL$href"
+                }
 
-                if (name.isNotBlank() && href.isNotBlank() && !categories.any { it.name.equals(name, ignoreCase = true) }) {
-                    val cleanId = href.trimEnd('/').substringAfterLast('/')
-                    categories.add(
-                        CategoryItem(
-                            id = if (cleanId.isNotBlank()) cleanId else name.lowercase().replace(" ", "_"),
-                            name = name,
-                            url = if (href.startsWith("http")) href else "$BASE_URL$href"
+                val match = categoryLinkRegex.find(href) ?: categoryLinkRegex.find(absUrl)
+                if (match != null) {
+                    val categoryId = match.groupValues[1]
+                    val rawName = link.text().trim()
+
+                    // Limpiar nombre si contiene conteos entre paréntesis, e.g. "Romance (142)"
+                    val cleanName = rawName.replace("""\(\d+\)""".toRegex(), "").trim()
+
+                    if (cleanName.isNotBlank() && !categories.any { it.id == categoryId }) {
+                        categories.add(
+                            CategoryItem(
+                                id = categoryId,
+                                name = cleanName,
+                                url = absUrl
+                            )
                         )
-                    )
+                    }
                 }
             }
+
+            if (categories.isEmpty()) {
+                throw ScrapingException(
+                    "No se encontraron enlaces de categorías válidas en $CATEGORIES_URL"
+                )
+            }
+
+            categories
+        } catch (e: ScrapingException) {
+            throw e
+        } catch (e: IOException) {
+            Log.e(TAG, "Error de red al conectar a $CATEGORIES_URL: ${e.message}")
+            throw ScrapingException("Error de conexión al cargar categorías: ${e.localizedMessage ?: "Servidor inaccesible"}", e)
         } catch (e: Exception) {
-            Log.w(TAG, "No se pudo obtener categorías en vivo: ${e.message}. Usando categorías predeterminadas.")
+            Log.e(TAG, "Error inesperado al procesar categorías: ${e.message}")
+            throw ScrapingException("Fallo al procesar categorías: ${e.localizedMessage ?: "Error desconocido"}", e)
         }
-
-        // Si la conexión falló o la página devolvió vacío (por apagón o cambios del sitio),
-        // devolvemos la lista curada de categorías reales de todorelatos.com
-        if (categories.isEmpty()) {
-            categories.addAll(getPredefinedCategories())
-        }
-
-        categories
     }
 
     /**
-     * Extrae el resumen de relatos de una categoría (links, título, autor, duración calculada).
+     * Extrae el listado de relatos para una categoría específica (ej. /categorias/1/).
+     * Captura:
+     * - Título
+     * - URL del relato (/relato/ID/)
+     * - Autor (/perfil/ID/ o tras texto "por")
+     * - Duración en minutos
+     *
+     * Regla estricta:
+     * Si la duración parseada en la tarjeta es > 25 minutos, se marca isDurationEligible = false.
+     * Lanza ScrapingException en caso de fallo de red (cero mock data).
      */
     suspend fun fetchStoriesForCategory(
         categoryUrl: String,
@@ -104,304 +189,214 @@ class ScraperService {
         maxStoriesToFetch: Int = 10
     ): List<ScrapedStorySummary> = withContext(Dispatchers.IO) {
         val summaries = mutableListOf<ScrapedStorySummary>()
+        val targetUrl = if (categoryUrl.startsWith("http")) categoryUrl else "$BASE_URL$categoryUrl"
 
         try {
-            val targetUrl = if (categoryUrl.startsWith("http")) categoryUrl else "$BASE_URL$categoryUrl"
             val doc: Document = Jsoup.connect(targetUrl)
                 .userAgent(USER_AGENT)
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                 .header("Accept-Language", "es-ES,es;q=0.9")
                 .timeout(TIMEOUT_MS)
                 .get()
 
-            // Buscar tarjetas o enlaces de relatos
-            val storyElements = doc.select("article, .relato-item, .card-relato, .post, .item-relato, div:has(> a[href*=/relato/])")
+            // Buscar todos los enlaces que apunten a /relato/ID/
+            val storyLinks = doc.select("a[href*=/relato/]")
 
-            if (storyElements.isNotEmpty()) {
-                for (item in storyElements) {
-                    if (summaries.size >= maxStoriesToFetch) break
+            for (link in storyLinks) {
+                if (summaries.size >= maxStoriesToFetch) break
 
-                    val linkEl = item.selectFirst("a[href*=/relato/], h2 a, h3 a, a") ?: continue
-                    val storyUrl = linkEl.attr("abs:href").ifBlank { linkEl.attr("href") }
-                    val title = linkEl.text().trim().ifBlank { item.selectFirst("h2, h3, .titulo")?.text()?.trim() ?: "Sin título" }
+                val href = link.attr("href")
+                val absUrl = link.attr("abs:href").ifBlank {
+                    if (href.startsWith("http")) href else "$BASE_URL$href"
+                }
 
-                    val author = item.selectFirst(".autor, .author, span:contains(Por), small:contains(Por)")?.text()
-                        ?.replace("Por:", "")?.replace("Por", "")?.trim() ?: "Anónimo"
+                val match = storyLinkRegex.find(href) ?: storyLinkRegex.find(absUrl) ?: continue
+                val storyId = match.groupValues[1]
 
-                    val durationText = item.selectFirst(".duracion, .tiempo, .lectura, span:contains(min), small:contains(min)")?.text() ?: item.text()
-                    val parsedMinutes = extractDurationMinutes(durationText)
+                // Evitar duplicados
+                if (summaries.any { it.id == storyId }) continue
 
-                    // Si no tiene duración explícita en la tarjeta, asignamos 10 min provisionales (se valida en detalle)
-                    val finalMinutes = if (parsedMinutes > 0) parsedMinutes else 10
-                    val isEligible = finalMinutes <= MAX_ALLOWED_DURATION_MINUTES
+                // Título
+                val title = link.text().trim().ifBlank {
+                    link.parent()?.selectFirst("h1, h2, h3, .titulo")?.text()?.trim() ?: "Relato #$storyId"
+                }
 
-                    val id = storyUrl.trimEnd('/').substringAfterLast('/')
+                // Contenedor padre de la tarjeta o elemento de lista
+                val container = link.parents().firstOrNull { parent ->
+                    parent.tagName() in listOf("article", "div", "li", "tr") &&
+                    parent.select("a[href*=/relato/]").size <= 2
+                } ?: link.parent()
 
-                    if (storyUrl.isNotBlank() && !summaries.any { it.id == id }) {
-                        summaries.add(
-                            ScrapedStorySummary(
-                                id = id,
-                                title = title,
-                                author = author,
-                                durationMinutes = finalMinutes,
-                                url = if (storyUrl.startsWith("http")) storyUrl else "$BASE_URL$storyUrl",
-                                isDurationEligible = isEligible
-                            )
-                        )
+                // Extraer autor: Enlace a /perfil/ID/ o texto que contenga "por"
+                var author = "Anónimo"
+                val profileLink = container?.selectFirst("a[href*=/perfil/]")
+                if (profileLink != null && profileLink.text().isNotBlank()) {
+                    author = profileLink.text().replace("""^por\s+""".toRegex(RegexOption.IGNORE_CASE), "").trim()
+                } else if (container != null) {
+                    val containerText = container.text()
+                    val authorMatch = """por\s+([A-Za-z0-9_áéíóúÁÉÍÓÚñÑ\.\-\s]{2,30})""".toRegex(RegexOption.IGNORE_CASE).find(containerText)
+                    if (authorMatch != null) {
+                        author = authorMatch.groupValues[1].trim()
                     }
                 }
-            } else {
-                // Fallback de búsqueda de enlaces genéricos a relatos
-                val generalLinks = doc.select("a[href*=/relato/], a[href*=-relato]")
-                for (link in generalLinks) {
-                    if (summaries.size >= maxStoriesToFetch) break
-                    val url = link.attr("abs:href")
-                    val title = link.text().trim()
-                    if (title.length > 5) {
-                        val parsedMinutes = extractDurationMinutes(link.parent()?.text() ?: "")
-                        val finalMinutes = if (parsedMinutes > 0) parsedMinutes else 12
-                        val isEligible = finalMinutes <= MAX_ALLOWED_DURATION_MINUTES
-                        val id = url.trimEnd('/').substringAfterLast('/')
 
-                        if (!summaries.any { it.id == id }) {
-                            summaries.add(
-                                ScrapedStorySummary(
-                                    id = id,
-                                    title = title,
-                                    author = "Comunidad",
-                                    durationMinutes = finalMinutes,
-                                    url = url,
-                                    isDurationEligible = isEligible
-                                )
-                            )
-                        }
-                    }
-                }
+                // Extraer tiempo de lectura de la tarjeta
+                val containerSnippet = container?.text() ?: ""
+                val parsedMinutes = extractDurationMinutes(containerSnippet)
+
+                // Si se detectó una duración válida en la tarjeta
+                val finalMinutes = if (parsedMinutes > 0) parsedMinutes else -1
+                val isEligible = finalMinutes in 1..MAX_ALLOWED_DURATION_MINUTES
+
+                summaries.add(
+                    ScrapedStorySummary(
+                        id = storyId,
+                        title = title,
+                        author = author,
+                        durationMinutes = finalMinutes,
+                        url = absUrl,
+                        isDurationEligible = isEligible
+                    )
+                )
             }
+
+            if (summaries.isEmpty()) {
+                Log.w(TAG, "No se encontraron relatos en $targetUrl")
+            }
+
+            summaries
+        } catch (e: IOException) {
+            Log.e(TAG, "Error de conexión al obtener relatos de $targetUrl: ${e.message}")
+            throw ScrapingException("No se pudo conectar a la categoría: ${e.localizedMessage ?: "Error de red"}", e)
         } catch (e: Exception) {
-            Log.w(TAG, "Error obteniendo relatos de $categoryUrl: ${e.message}")
+            Log.e(TAG, "Error inesperado al parsear relatos de $targetUrl: ${e.message}")
+            throw ScrapingException("Error al procesar la lista de relatos: ${e.localizedMessage ?: "Fallo inesperado"}", e)
         }
-
-        // Si falló el scrape en vivo por falta de internet o servidor caído,
-        // generamos historias de muestra verificadas de alta calidad para probar sin conexión
-        if (summaries.isEmpty()) {
-            summaries.addAll(getSampleStorySummaries(categoryName))
-        }
-
-        summaries
     }
 
     /**
-     * Descarga y limpia el texto del relato.
-     * Retorna StoryEntity si la duración es <= 25 minutos.
-     * Retorna null si la duración excede los 25 minutos (cumplimiento estricto de regla).
+     * Descarga y limpia el contenido completo de un relato individual (/relato/ID/).
+     *
+     * Reglas estrictas:
+     * 1. Si la duración previa en el resumen ya es > 25 minutos, se descarta INMEDIATAMENTE
+     *    sin descargar el HTML pesado ni procesar el contenido.
+     * 2. Extrae y formatea el texto limpio: descarta scripts, estilos, publicidad, nav, cabeceras y botones sociales.
+     * 3. Extrae la duración precisa desde la página del relato (ej. "Tiempo estimado de lectura: [ 15 min. ]").
+     * 4. Si la página no contiene etiqueta de duración, se calcula en tiempo real por palabras: (palabras / 190).
+     * 5. REGLA CRÍTICA: Si la duración final es > 25 minutos, devuelve null (relato omitido).
+     * 6. Lanza ScrapingException si falla la red (cero inyecciones de datos falsos/mocks).
      */
     suspend fun fetchStoryContent(
         summary: ScrapedStorySummary,
         categoryName: String
     ): StoryEntity? = withContext(Dispatchers.IO) {
+        // FILTRO PRELIMINAR INMEDIATO: Si ya sabemos que supera 25 minutos, omitir sin descargar HTML
+        if (summary.durationMinutes > MAX_ALLOWED_DURATION_MINUTES) {
+            Log.i(TAG, "Relato '${summary.title}' OMITIDO previamente: ${summary.durationMinutes} min > $MAX_ALLOWED_DURATION_MINUTES min.")
+            return@withContext null
+        }
+
         try {
-            var extractedText = ""
-            var verifiedDuration = summary.durationMinutes
-            var finalAuthor = summary.author
-            var finalTitle = summary.title
+            val doc: Document = Jsoup.connect(summary.url)
+                .userAgent(USER_AGENT)
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "es-ES,es;q=0.9")
+                .timeout(TIMEOUT_MS)
+                .get()
 
-            if (summary.url.startsWith("http")) {
-                val doc: Document = Jsoup.connect(summary.url)
-                    .userAgent(USER_AGENT)
-                    .timeout(TIMEOUT_MS)
-                    .get()
+            // 1. Extraer duración exacta desde la página de detalle
+            val entirePageText = doc.text()
+            var detectedDuration = extractDurationMinutes(entirePageText)
 
-                // Intentar extraer duración oficial desde el detalle
-                val pageText = doc.text()
-                val detailDuration = extractDurationMinutes(doc.select(".duracion, .lectura, .info-relato").text().ifBlank { pageText })
-                if (detailDuration > 0) {
-                    verifiedDuration = detailDuration
-                }
-
-                // Selector de contenido principal limpio
-                val contentElement = doc.selectFirst("div.texto, div.relato, div.contenido, article .entry-content, #cuerpo-relato, div.post-content, .cuerpo")
-                    ?: doc.selectFirst("article")
-
-                if (contentElement != null) {
-                    // Remover scripts, estilos, anuncios, iframes
-                    contentElement.select("script, style, iframe, .ads, .publicidad, nav, footer, header, .compartir, .social").remove()
-                    extractedText = cleanStoryHtml(contentElement)
-                } else {
-                    // Fallback: juntar párrafos
-                    val paragraphs = doc.select("p")
-                    val filteredParagraphs = paragraphs.filter { it.text().trim().length > 30 }
-                    extractedText = filteredParagraphs.joinToString("\n\n") { it.text().trim() }
-                }
-
-                val titleElement = doc.selectFirst("h1, .titulo-relato, h2.title")
-                if (titleElement != null && titleElement.text().isNotBlank()) {
-                    finalTitle = titleElement.text().trim()
-                }
-
-                val authorElement = doc.selectFirst(".autor, a[href*=/autor/], .author")
-                if (authorElement != null && authorElement.text().isNotBlank()) {
-                    finalAuthor = authorElement.text().trim()
-                }
+            // 2. Extraer y limpiar título
+            var cleanTitle = summary.title
+            val h1 = doc.selectFirst("h1, .titulo-relato, .entry-title")
+            if (h1 != null && h1.text().isNotBlank()) {
+                cleanTitle = h1.text().trim()
             }
 
-            // Si el texto está vacío (por ejemplo en prueba offline), usar contenido preconfigurado
-            if (extractedText.isBlank()) {
-                val sample = getSampleStoryContent(summary.title, categoryName)
-                extractedText = sample.contentHtmlOrText
-                verifiedDuration = sample.durationMinutes
+            // 3. Extraer y limpiar autor
+            var cleanAuthor = summary.author
+            val authorEl = doc.selectFirst("a[href*=/perfil/], .autor, .author")
+            if (authorEl != null && authorEl.text().isNotBlank()) {
+                cleanAuthor = authorEl.text().replace("""^por\s+""".toRegex(RegexOption.IGNORE_CASE), "").trim()
             }
 
-            // Calcular estimación basada en palabras si la duración sigue en valor por defecto: ~180-200 ppm
-            val wordCount = extractedText.split("\\s+".toRegex()).size
-            if (verifiedDuration <= 0) {
-                verifiedDuration = (wordCount / 190).coerceAtLeast(1)
+            // 4. Selector del contenedor de texto y saneamiento de elementos no deseados
+            val contentElement: Element? = doc.selectFirst(
+                "div.texto, div.relato, #cuerpo-relato, div.contenido, article .entry-content, div.post-content, .cuerpo, div#texto"
+            ) ?: doc.selectFirst("article")
+
+            val cleanedText: String
+            if (contentElement != null) {
+                // Eliminar anuncios, cabeceras, scripts, estilos, formularios y barras sociales
+                contentElement.select(
+                    "script, style, iframe, .ads, .publicidad, nav, footer, header, .compartir, .social, .breadcrumb, form, button"
+                ).remove()
+                cleanedText = cleanStoryHtml(contentElement)
+            } else {
+                // Fallback de extracción por párrafos con longitud significativa
+                val paragraphs = doc.select("p").filter { it.text().trim().length > 35 }
+                cleanedText = paragraphs.joinToString("\n\n") { it.text().trim() }
             }
 
-            // REGLA CRÍTICA: Validar estrictamente que la duración sea <= 25 minutos
-            if (verifiedDuration > MAX_ALLOWED_DURATION_MINUTES) {
-                Log.i(TAG, "Relato '${summary.title}' OMITIDO: Duración de $verifiedDuration min supera el límite de 25 min.")
+            if (cleanedText.isBlank()) {
+                throw ScrapingException("No se pudo extraer contenido de texto legible en ${summary.url}")
+            }
+
+            // 5. Cálculo de duración por palabras si la web no indicó la etiqueta de tiempo
+            if (detectedDuration <= 0) {
+                detectedDuration = calculateDurationFromWordCount(cleanedText)
+                Log.d(TAG, "Duración calculada por palabras para '${summary.title}': $detectedDuration min")
+            }
+
+            // 6. REGLA DE NEGOCIO CRÍTICA: Filtrar y OMITIR si supera 25 minutos
+            if (detectedDuration > MAX_ALLOWED_DURATION_MINUTES) {
+                Log.i(TAG, "Relato '$cleanTitle' OMITIDO: Duración de $detectedDuration min supera los $MAX_ALLOWED_DURATION_MINUTES min permitidos.")
                 return@withContext null
             }
 
             StoryEntity(
-                id = summary.id.ifBlank { "${categoryName.lowercase()}_${System.currentTimeMillis()}" },
-                title = finalTitle,
+                id = summary.id.ifBlank { "relato_${System.currentTimeMillis()}" },
+                title = cleanTitle,
                 category = categoryName,
-                author = finalAuthor,
-                durationMinutes = verifiedDuration,
-                contentHtmlOrText = extractedText,
+                author = cleanAuthor.ifBlank { "Anónimo" },
+                durationMinutes = detectedDuration,
+                contentHtmlOrText = cleanedText,
                 isFavorite = false,
                 isRead = false,
                 savedAt = System.currentTimeMillis()
             )
+        } catch (e: IOException) {
+            Log.e(TAG, "Error de red al descargar relato ${summary.url}: ${e.message}")
+            throw ScrapingException("Error de red al descargar relato '${summary.title}': ${e.localizedMessage ?: "Conexión perdida"}", e)
+        } catch (e: ScrapingException) {
+            throw e
         } catch (e: Exception) {
-            Log.w(TAG, "Error extrayendo relato '${summary.title}': ${e.message}")
-            // En caso de caída de internet o fallo en un relato particular, no detener el resto
-            null
+            Log.e(TAG, "Error al procesar el contenido de ${summary.url}: ${e.message}")
+            throw ScrapingException("Error inesperado en '${summary.title}': ${e.localizedMessage ?: "Fallo de parsing"}", e)
         }
     }
 
     /**
-     * Limpia elementos HTML y retorna un texto formateado con espaciado natural para lectura.
+     * Limpia los elementos HTML dejando un texto plano legible estructurado en párrafos.
      */
     private fun cleanStoryHtml(element: Element): String {
-        val paragraphs = element.select("p, div.parrafo, br")
+        val paragraphs = element.select("p, div.parrafo")
         if (paragraphs.isNotEmpty()) {
             val sb = StringBuilder()
-            for (p in element.select("p")) {
+            for (p in paragraphs) {
                 val text = p.text().trim()
                 if (text.isNotBlank()) {
                     sb.append(text).append("\n\n")
                 }
             }
-            if (sb.isNotBlank()) return sb.toString().trim()
+            val result = sb.toString().trim()
+            if (result.isNotBlank()) return result
         }
-        return element.text().trim()
-    }
 
-    /**
-     * Lista de categorías predeterminadas del sitio todorelatos.com.
-     * Garantiza funcionamiento instantáneo incluso durante apagones sin conexión inicial.
-     */
-    private fun getPredefinedCategories(): List<CategoryItem> = listOf(
-        CategoryItem("romance", "Romance y Amor", "$BASE_URL/categoria/romance/", 14),
-        CategoryItem("aventuras", "Aventuras y Acción", "$BASE_URL/categoria/aventura/", 18),
-        CategoryItem("suspenso", "Suspenso e Intriga", "$BASE_URL/categoria/suspenso/", 22),
-        CategoryItem("fantasia", "Fantasía y Magia", "$BASE_URL/categoria/fantasia/", 15),
-        CategoryItem("terror", "Terror y Misterio", "$BASE_URL/categoria/terror/", 19),
-        CategoryItem("ciencia_ficcion", "Ciencia Ficción", "$BASE_URL/categoria/ciencia-ficcion/", 12),
-        CategoryItem("humor", "Humor y Comedia", "$BASE_URL/categoria/humor/", 9),
-        CategoryItem("drama", "Drama y Emociones", "$BASE_URL/categoria/drama/", 16),
-        CategoryItem("vivencias", "Vivencias Personales", "$BASE_URL/categoria/vivencias/", 11)
-    )
-
-    /**
-     * Relatos de muestra con duraciones variadas (incluyendo casos de prueba para el filtro > 25 min).
-     */
-    private fun getSampleStorySummaries(categoryName: String): List<ScrapedStorySummary> = listOf(
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_1",
-            title = "La Carta de las Tres de la Mañana",
-            author = "Marcos Estrada",
-            durationMinutes = 8,
-            url = "$BASE_URL/relato/carta-tres-manana",
-            isDurationEligible = true
-        ),
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_2",
-            title = "El Secreto del Tranvía Nocturno",
-            author = "Elena Valdés",
-            durationMinutes = 14,
-            url = "$BASE_URL/relato/secreto-tranvia",
-            isDurationEligible = true
-        ),
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_3",
-            title = "Crónica de una Noche sin Farolas",
-            author = "Javier Cifuentes",
-            durationMinutes = 21,
-            url = "$BASE_URL/relato/noche-sin-farolas",
-            isDurationEligible = true
-        ),
-        // Relato que DEBE SER OMITIDO por la regla de negocio (> 25 min)
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_4_omitida",
-            title = "La Odisea del Guardián del Faro (Novela)",
-            author = "Guillermo Navarro",
-            durationMinutes = 38, // EXCEDIDO: Debe ser omitido
-            url = "$BASE_URL/relato/guardian-faro-novela",
-            isDurationEligible = false
-        ),
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_5",
-            title = "Café con Aroma a Despedida",
-            author = "Silvia Mendizábal",
-            durationMinutes = 6,
-            url = "$BASE_URL/relato/cafe-despedida",
-            isDurationEligible = true
-        ),
-        // Otro relato que DEBE SER OMITIDO por la regla (> 25 min)
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_6_omitida",
-            title = "El Legado de los Tres Imperios (Capítulo Extenso)",
-            author = "Ernesto Padrón",
-            durationMinutes = 45, // EXCEDIDO: Debe ser omitido
-            url = "$BASE_URL/relato/legado-tres-imperios",
-            isDurationEligible = false
-        ),
-        ScrapedStorySummary(
-            id = "${categoryName.lowercase()}_7",
-            title = "Murmullos en la Vieja Estación",
-            author = "Beatriz Oramas",
-            durationMinutes = 11,
-            url = "$BASE_URL/relato/murmullos-estacion",
-            isDurationEligible = true
-        )
-    )
-
-    private fun getSampleStoryContent(title: String, category: String): StoryEntity {
-        val sampleText = """
-El reloj marcaba la medianoche cuando las luces de la calle se apagaron por completo. La brisa cálida se colaba por los listones de madera de la ventana entreabierta, trayendo consigo el aroma a salitre y asfalto fresco.
-
-En medio del silencio, el tintineo tenue de una taza de café sobre el plato de porcelana pareció resonar con la fuerza de un trueno. Había algo reconfortante en la penumbra, una sensación de intimidad compartida entre quienes aprendieron a encontrar refugio en las sombras de la noche.
-
-—Siempre ocurre a la misma hora —susurró mientras acomodaba los manuscritos sobre la vieja mesa de caoba—. La soledad no es la ausencia de compañía, sino el espacio donde las palabras por fin se atreven a hablar.
-
-Encendió una vela de parafina que proyectó sombras danzantes sobre las paredes encaladas. Abrió la libreta de tapas negras y comenzó a trazar líneas pausadas con tinta azul. Cada frase era un homenaje a los instantes cotidianos que escapan al ajetreo del día: la risa de un niño en la esquina, el vendedor de periódicos doblando la esquina al alba, los adioses que nunca llegaron a pronunciarse en los andenes.
-
-La noche avanzaba con lentitud piadosa. Conforme pasaban los minutos, la penumbra ya no era un obstáculo, sino el lienzo perfecto para sumergirse en historias que trascienden el tiempo y el lugar. Cuando el primer destello púrpura del amanecer tiñó el horizonte, cerró la libreta con la certeza de que las mejores historias nacen precisamente allí donde nadie espera encontrarlas.
-        """.trimIndent()
-
-        return StoryEntity(
-            id = "${category.lowercase()}_${System.currentTimeMillis()}",
-            title = title,
-            category = category,
-            author = "Autor de la Comunidad",
-            durationMinutes = 7,
-            contentHtmlOrText = sampleText,
-            isFavorite = false,
-            isRead = false,
-            savedAt = System.currentTimeMillis()
-        )
+        // Reemplazar saltos <br> por saltos de línea y extraer texto
+        element.select("br").append("\\n")
+        return element.text().replace("\\n", "\n").trim()
     }
 }

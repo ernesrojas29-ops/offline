@@ -12,6 +12,12 @@ class ExampleUnitTest {
 
     @Test
     fun `extractDurationMinutes parses various duration formats with regex`() {
+        // Formato real de movil.todorelatos.com
+        assertEquals(15, scraperService.extractDurationMinutes("Tiempo estimado de lectura: [ 15 min. ]"))
+        assertEquals(8, scraperService.extractDurationMinutes("[ 8 min. ]"))
+        assertEquals(22, scraperService.extractDurationMinutes("[22 min.]"))
+
+        // Formatos generales
         assertEquals(12, scraperService.extractDurationMinutes("Lectura: 12 min"))
         assertEquals(5, scraperService.extractDurationMinutes("5 min"))
         assertEquals(18, scraperService.extractDurationMinutes("Lectura aproximada: 18 minutos"))
@@ -33,5 +39,22 @@ class ExampleUnitTest {
         assertTrue("Stories with 25 min must be accepted (<= 25)", storyDuration2 <= maxAllowed)
         assertFalse("Stories with 26 min must be omitted (> 25)", storyDuration3 <= maxAllowed)
         assertFalse("Stories with 45 min must be omitted (> 25)", storyDuration4 <= maxAllowed)
+    }
+
+    @Test
+    fun `calculateDurationFromWordCount uses 190 words per minute rule`() {
+        // 380 palabras deberían equivaler a 2 minutos
+        val text380Words = (1..380).joinToString(" ") { "palabra" }
+        assertEquals(2, scraperService.calculateDurationFromWordCount(text380Words))
+
+        // 100 palabras deberían ser redondeadas al mínimo de 1 minuto
+        val text100Words = (1..100).joinToString(" ") { "palabra" }
+        assertEquals(1, scraperService.calculateDurationFromWordCount(text100Words))
+
+        // 5700 palabras = 30 minutos (superaría el límite de 25)
+        val text5700Words = (1..5700).joinToString(" ") { "palabra" }
+        val calculated = scraperService.calculateDurationFromWordCount(text5700Words)
+        assertEquals(30, calculated)
+        assertTrue("Calculated duration should exceed 25 minutes limit", calculated > ScraperService.MAX_ALLOWED_DURATION_MINUTES)
     }
 }

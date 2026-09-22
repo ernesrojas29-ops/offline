@@ -1,27 +1,39 @@
 package com.example.ui
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.example.data.local.StoryEntity
+import com.example.data.preferences.UserPreferencesRepository
 import com.example.data.repository.StoryRepository
 import com.example.data.scraper.CategoryItem
 import com.example.data.scraper.ScrapingProgress
-import kotlinx.coroutines.Job
+import com.example.worker.SyncStoriesWorker
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class MainViewModel(
-    private val repository: StoryRepository
+    private val context: Context,
+    private val repository: StoryRepository,
+    private val preferencesRepository: UserPreferencesRepository
 ) : ViewModel() {
 
-    // --- ESTADO DE CATEGORÍAS Y DESCARGA ---
+    private val workManager = WorkManager.getInstance(context)
+
+    // --- ESTADO DE CATEGORÍAS Y SINCRONIZACIÓN WORKMANAGER ---
     private val _availableCategories = MutableStateFlow<List<CategoryItem>>(emptyList())
     val availableCategories: StateFlow<List<CategoryItem>> = _availableCategories.asStateFlow()
 
@@ -31,12 +43,66 @@ class MainViewModel(
     private val _isCategoriesLoading = MutableStateFlow(false)
     val isCategoriesLoading: StateFlow<Boolean> = _isCategoriesLoading.asStateFlow()
 
-    private val _scrapingProgress = MutableStateFlow(ScrapingProgress())
-    val scrapingProgress: StateFlow<ScrapingProgress> = _scrapingProgress.asStateFlow()
+    // Observar progreso real desde WorkManager
+    val scrapingProgress: StateFlow<ScrapingProgress> = workManager
+        .getWorkInfosForUniqueWorkFlow(SyncStoriesWorker.UNIQUE_WORK_NAME)
+        .map { workInfoList ->
+            val workInfo = workInfoList.firstOrNull() ?: return@map ScrapingProgress()
 
-    private var syncJob: Job? = null
+            val progressData = workInfo.progress
+            val outputData = workInfo.outputData
 
-    // --- ESTADO DE BIBLIOTECA OFFLINE ---
+            when (workInfo.state) {
+                WorkInfo.State.RUNNING -> {
+                    ScrapingProgress(
+                        isRunning = true,
+                        currentCategory = progressData.getString(SyncStoriesWorker.PROGRESS_CATEGORY) ?: "",
+                        currentStoryTitle = progressData.getString(SyncStoriesWorker.PROGRESS_STORY_TITLE) ?: "",
+                        downloadedCount = progressData.getInt(SyncStoriesWorker.PROGRESS_DOWNLOADED, 0),
+                        skippedDueToDurationCount = progressData.getInt(SyncStoriesWorker.PROGRESS_SKIPPED, 0),
+                        totalProcessed = progressData.getInt(SyncStoriesWorker.PROGRESS_TOTAL, 0),
+                        statusMessage = progressData.getString(SyncStoriesWorker.PROGRESS_STATUS_MSG) ?: "Descargando en segundo plano...",
+                        isFinished = false
+                    )
+                }
+                WorkInfo.State.SUCCEEDED -> {
+                    val downloaded = outputData.getInt(SyncStoriesWorker.PROGRESS_DOWNLOADED, 0)
+                    val skipped = outputData.getInt(SyncStoriesWorker.PROGRESS_SKIPPED, 0)
+                    ScrapingProgress(
+                        isRunning = false,
+                        isFinished = true,
+                        downloadedCount = downloaded,
+                        skippedDueToDurationCount = skipped,
+                        statusMessage = outputData.getString(SyncStoriesWorker.PROGRESS_STATUS_MSG)
+                            ?: "Sincronización completada. $downloaded relatos guardados."
+                    )
+                }
+                WorkInfo.State.FAILED -> {
+                    ScrapingProgress(
+                        isRunning = false,
+                        isFinished = true,
+                        error = outputData.getString(SyncStoriesWorker.PROGRESS_STATUS_MSG) ?: "Error en la sincronización.",
+                        statusMessage = "Fallo en la sincronización."
+                    )
+                }
+                WorkInfo.State.CANCELLED -> {
+                    ScrapingProgress(
+                        isRunning = false,
+                        isFinished = false,
+                        statusMessage = "Sincronización cancelada por el usuario."
+                    )
+                }
+                WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> {
+                    ScrapingProgress(
+                        isRunning = true,
+                        statusMessage = "En cola para iniciar descarga..."
+                    )
+                }
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ScrapingProgress())
+
+    // --- ESTADO DE BIBLIOTECA OFFLINE (ROOM) ---
     private val _selectedCategoryFilter = MutableStateFlow("Todas")
     val selectedCategoryFilter: StateFlow<String> = _selectedCategoryFilter.asStateFlow()
 
@@ -55,7 +121,6 @@ class MainViewModel(
     val totalSavedStoriesCount: StateFlow<Int> = repository.totalCount
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
-    // Lista reactiva de relatos filtrados por categoría, búsqueda y switches
     val displayedStories: StateFlow<List<StoryEntity>> = combine(
         _selectedCategoryFilter,
         _searchQuery
@@ -77,12 +142,12 @@ class MainViewModel(
         if (id != null) repository.getStoryById(id) else MutableStateFlow(null)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    // Ajustes de lectura nocturna
-    private val _readerFontSize = MutableStateFlow(18) // Sp
-    val readerFontSize: StateFlow<Int> = _readerFontSize.asStateFlow()
+    // Ajustes persistidos en Jetpack DataStore Preferences
+    val readerFontSize: StateFlow<Int> = preferencesRepository.fontSizeFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserPreferencesRepository.DEFAULT_FONT_SIZE)
 
-    private val _isAmoledBlack = MutableStateFlow(true) // Por defecto fondo negro puro AMOLED #000000
-    val isAmoledBlack: StateFlow<Boolean> = _isAmoledBlack.asStateFlow()
+    val isAmoledBlack: StateFlow<Boolean> = preferencesRepository.isAmoledThemeFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserPreferencesRepository.DEFAULT_AMOLED_THEME)
 
     init {
         loadAvailableCategories()
@@ -94,12 +159,11 @@ class MainViewModel(
             try {
                 val list = repository.fetchAvailableCategories()
                 _availableCategories.value = list
-                // Seleccionar las primeras 3 por conveniencia
                 if (_selectedCategoryIds.value.isEmpty()) {
                     _selectedCategoryIds.value = list.take(3).map { it.id }.toSet()
                 }
             } catch (e: Exception) {
-                // El servicio ya provee lista predefinida si falla
+                // Notificar en la interfaz sin datos falsos
             } finally {
                 _isCategoriesLoading.value = false
             }
@@ -124,24 +188,35 @@ class MainViewModel(
         _selectedCategoryIds.value = emptySet()
     }
 
+    /**
+     * Inicia la sincronización delegándola a WorkManager.
+     * Si el proceso muere, la descarga continúa o se reanuda de forma segura.
+     */
     fun startSync() {
         val selected = _availableCategories.value.filter { _selectedCategoryIds.value.contains(it.id) }
         if (selected.isEmpty()) return
 
-        syncJob?.cancel()
-        syncJob = viewModelScope.launch {
-            repository.syncCategories(selected).collect { progress ->
-                _scrapingProgress.value = progress
-            }
-        }
+        val inputData = workDataOf(
+            SyncStoriesWorker.KEY_CATEGORY_IDS to selected.map { it.id }.toTypedArray(),
+            SyncStoriesWorker.KEY_CATEGORY_NAMES to selected.map { it.name }.toTypedArray(),
+            SyncStoriesWorker.KEY_CATEGORY_URLS to selected.map { it.url }.toTypedArray(),
+            SyncStoriesWorker.KEY_MAX_PER_CAT to 8
+        )
+
+        val workRequest = OneTimeWorkRequestBuilder<SyncStoriesWorker>()
+            .setInputData(inputData)
+            .addTag(SyncStoriesWorker.TAG)
+            .build()
+
+        workManager.enqueueUniqueWork(
+            SyncStoriesWorker.UNIQUE_WORK_NAME,
+            ExistingWorkPolicy.REPLACE,
+            workRequest
+        )
     }
 
     fun cancelSync() {
-        syncJob?.cancel()
-        _scrapingProgress.value = _scrapingProgress.value.copy(
-            isRunning = false,
-            statusMessage = "Sincronización detenida por el usuario."
-        )
+        workManager.cancelUniqueWork(SyncStoriesWorker.UNIQUE_WORK_NAME)
     }
 
     // --- ACCIONES DE BIBLIOTECA ---
@@ -179,10 +254,15 @@ class MainViewModel(
         }
     }
 
-    // --- ACCIONES DEL LECTOR ---
+    fun deleteAllStories() {
+        viewModelScope.launch {
+            repository.deleteAllStories()
+        }
+    }
+
+    // --- ACCIONES DEL LECTOR Y DATASTORE ---
     fun openStory(id: String) {
         _currentStoryId.value = id
-        // Marcar como leído automáticamente al abrir
         viewModelScope.launch {
             repository.setRead(id, true)
         }
@@ -193,26 +273,38 @@ class MainViewModel(
     }
 
     fun increaseFontSize() {
-        if (_readerFontSize.value < 32) {
-            _readerFontSize.value += 2
+        viewModelScope.launch {
+            val current = readerFontSize.value
+            if (current < 32) {
+                preferencesRepository.setFontSize(current + 2)
+            }
         }
     }
 
     fun decreaseFontSize() {
-        if (_readerFontSize.value > 12) {
-            _readerFontSize.value -= 2
+        viewModelScope.launch {
+            val current = readerFontSize.value
+            if (current > 12) {
+                preferencesRepository.setFontSize(current - 2)
+            }
         }
     }
 
     fun toggleAmoledMode() {
-        _isAmoledBlack.value = !_isAmoledBlack.value
+        viewModelScope.launch {
+            preferencesRepository.setAmoledTheme(!isAmoledBlack.value)
+        }
     }
 
-    class Factory(private val repository: StoryRepository) : ViewModelProvider.Factory {
+    class Factory(
+        private val context: Context,
+        private val repository: StoryRepository,
+        private val preferencesRepository: UserPreferencesRepository
+    ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             if (modelClass.isAssignableFrom(MainViewModel::class.java)) {
-                return MainViewModel(repository) as T
+                return MainViewModel(context.applicationContext, repository, preferencesRepository) as T
             }
             throw IllegalArgumentException("Unknown ViewModel class")
         }

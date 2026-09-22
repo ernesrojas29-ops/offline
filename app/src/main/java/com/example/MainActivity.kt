@@ -55,11 +55,12 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val database = AppDatabase.getDatabase(applicationContext)
+        val preferencesRepository = com.example.data.preferences.UserPreferencesRepository(applicationContext)
         val scraperService = ScraperService()
         val repository = StoryRepository(database.storyDao(), scraperService)
         val viewModel = androidx.lifecycle.ViewModelProvider(
             this,
-            MainViewModel.Factory(repository)
+            MainViewModel.Factory(applicationContext, repository, preferencesRepository)
         )[MainViewModel::class.java]
 
         setContent {
